@@ -3,6 +3,7 @@ import numpy as np
 
 _UNSET = object()
 
+
 @dataclass
 class PeriodicSquareBox2D:
     """
@@ -18,7 +19,8 @@ class PeriodicSquareBox2D:
         """
         Wrap coordinates into [0, L).
         """
-        return np.mod(coords, self.box_length)
+        wrapped = np.mod(coords, self.box_length)
+        return np.where(np.isclose(wrapped, self.box_length), 0.0, wrapped)
 
     def displacement(self, coords1: np.array, coords2: np.array) -> np.array:
         """
@@ -92,6 +94,9 @@ class ParticlesInaBox(list):
     ):
         self.particles = list(particles) if particles is not None else []
         self.box = box
+        if self.box is not None:
+            for particle in self.particles:
+                particle.coords = self.box.wrap(particle.coords)
 
     def print_particles(self):
         for p in self.particles:
@@ -196,9 +201,12 @@ class ThreeBodySimulation:
         for previous_particle, current_particle, acceleration in zip(
             previous_particles, self.system.particles, accelerations
         ):
+            step_displacement = self.system.box.displacement(
+                previous_particle.coords, current_particle.coords
+            )
             next_coords = (
-                2 * current_particle.coords
-                - previous_particle.coords
+                current_particle.coords
+                + step_displacement
                 + acceleration * self.time_step**2
             )
             next_coords = self.system.box.wrap(next_coords)
@@ -235,15 +243,18 @@ class ThreeBodySimulation:
 
 def main():
 
-    p1 = Particle(mass=1, time=0, coords=[0, 0], vel=[0, 0])
-    p2 = Particle(mass=1, time=0, coords=[1, 1], vel=[0, 0])
-    p3 = Particle(mass=1, time=0, coords=[-1, -1], vel=[0, 0])
-    box = PeriodicSquareBox2D(box_length=20)
+    box = PeriodicSquareBox2D(box_length=100)
+    box_center = np.asarray([box.half_box_length, box.half_box_length])
+    box_quarter = box_center / 2
+
+    p1 = Particle(mass=100, time=0, coords=box_center, vel=[0, 0])
+    p2 = Particle(mass=1, time=0, coords=box_center + box_quarter, vel=[1, 0])
+    p3 = Particle(mass=1, time=0, coords=box_center - box_quarter, vel=[1, 1])
     system = ParticlesInaBox([p1, p2, p3], box=box)
 
-    interaction = GravitationalInteraction()
-    simulation = ThreeBodySimulation(system, interaction, time_step=0.01)
-    history = simulation.run(n_steps=10)
+    interaction = GravitationalInteraction(grav_ct=1)
+    simulation = ThreeBodySimulation(system, interaction, time_step=0.1)
+    history = simulation.run(n_steps=100)
 
     for step, particles in enumerate(history):
         print(f"step={step}")
