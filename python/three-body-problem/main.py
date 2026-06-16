@@ -810,26 +810,26 @@ def main() -> None:
             "axes.grid": True,
         }
     )
-    box = PeriodicSquareBox2D(box_length=35)
+    box = PeriodicSquareBox2D(box_length=100)
     box_center = np.array([box.half_box_length, box.half_box_length])
 
     # this is a deliberately asymmetric binary-plus-intruder setup.
     # it is less orderly than the figure-eight orbit, which tends to make the
     # trails and the final video more visually interesting.
-    r1 = box_center + np.array([0.0, 10.0])
+    r1 = box_center + np.array([0.0, 7.0])
     r2 = box_center
-    r3 = box_center + np.array([0.0, -10.0])
+    r3 = box_center + np.array([0.0, -20.0])
 
-    v1 = np.array([-1.5, -0.2])
+    v1 = np.array([-1.0, -0.1])
     v2 = np.array([0.0, 0.0])
     v3 = np.array([1.5, 0.2])
 
-    p1 = Particle(mass=3.0, time=0, coords=r1, vel=v1)
-    p2 = Particle(mass=50, time=0, coords=r2, vel=v2)
-    p3 = Particle(mass=0.9, time=0, coords=r3, vel=v3)
+    p1 = Particle(mass=1.0, time=0, coords=r1, vel=v1)
+    p2 = Particle(mass=100, time=0, coords=r2, vel=v2)
+    p3 = Particle(mass=1.0, time=0, coords=r3, vel=v3)
     system = ParticlesInaBox([p1, p2, p3], box=box)
 
-    interaction = GravitationalInteraction(gravitational_constant=1.0)
+    interaction = GravitationalInteraction(gravitational_constant=0.5)
     integrator = PositionVerlet(
         t_bounds=(0.0, 144.0),
         n_steps=24_000,
@@ -840,8 +840,8 @@ def main() -> None:
     )
     if args.live_preview:
         simulation.live_preview(
-            steps_per_frame=15,
-            trail_length=150,
+            steps_per_frame=25,
+            trail_length=500,
             interval_ms=16,
         )
     else:
