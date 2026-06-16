@@ -17,6 +17,7 @@ Most implementations are intentionally self-contained and designed as one-off pr
 ## Current Residents
 
 * Three-Body Problem: `python`
+* Particle Life: `python`
 * Conway's Game of Life:
 * Leina:
 * Double pendulum:
