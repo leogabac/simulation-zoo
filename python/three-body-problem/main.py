@@ -829,7 +829,7 @@ def main() -> None:
     p3 = Particle(mass=1.0, time=0, coords=r3, vel=v3)
     system = ParticlesInaBox([p1, p2, p3], box=box)
 
-    interaction = GravitationalInteraction(gravitational_constant=0.5)
+    interaction = GravitationalInteraction(gravitational_constant=0.0)
     integrator = PositionVerlet(
         t_bounds=(0.0, 144.0),
         n_steps=24_000,
