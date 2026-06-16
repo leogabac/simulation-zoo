@@ -16,6 +16,11 @@ import matplotlib.pyplot as plt
 import fubumio as fm
 from sysentropy import LoggerConfig, get_logger
 
+try:
+    from numba import njit
+except ImportError:  # pragma: no cover
+    njit = None
+
 # sentinel object
 _UNSET = object()
 
@@ -28,6 +33,125 @@ TYPE_MAP = {
     type_index: color
     for type_index, color in enumerate(PARTICLE_PALETTE)
 }
+
+
+def _identity_decorator(function):
+    return function
+
+
+_njit = njit if njit is not None else _identity_decorator
+
+
+@_njit
+def _compute_particle_life_forces(
+    coords: np.ndarray,
+    types: np.ndarray,
+    interaction_matrix: np.ndarray,
+    box_length: float,
+    interaction_radius: float,
+    repulsion_radius: float,
+    force_scale: float,
+) -> np.ndarray:
+    n_particles = coords.shape[0]
+    forces = np.zeros((n_particles, 2), dtype=np.float64)
+
+    for i in range(n_particles):
+        for j in range(n_particles):
+            if i == j:
+                continue
+
+            dx = coords[j, 0] - coords[i, 0]
+            dy = coords[j, 1] - coords[i, 1]
+
+            dx = dx - box_length * np.round(dx / box_length)
+            dy = dy - box_length * np.round(dy / box_length)
+
+            distance = np.sqrt(dx * dx + dy * dy)
+            if distance == 0.0 or distance >= interaction_radius:
+                continue
+
+            if distance < repulsion_radius:
+                radial_factor = distance / repulsion_radius - 1.0
+            else:
+                radial_factor = 1.0 - (
+                    (distance - repulsion_radius)
+                    / (interaction_radius - repulsion_radius)
+                )
+
+            strength = interaction_matrix[types[i], types[j]]
+            scale = force_scale * strength * radial_factor / distance
+            forces[i, 0] += scale * dx
+            forces[i, 1] += scale * dy
+
+    return forces
+
+
+@_njit
+def _compute_particle_life_forces_cell_list(
+    coords: np.ndarray,
+    types: np.ndarray,
+    interaction_matrix: np.ndarray,
+    box_length: float,
+    interaction_radius: float,
+    repulsion_radius: float,
+    force_scale: float,
+) -> np.ndarray:
+    n_particles = coords.shape[0]
+    forces = np.zeros((n_particles, 2), dtype=np.float64)
+
+    n_cells = max(1, int(np.floor(box_length / interaction_radius)))
+    cell_size = box_length / n_cells
+    head = np.full(n_cells * n_cells, -1, dtype=np.int64)
+    next_index = np.full(n_particles, -1, dtype=np.int64)
+    cell_x = np.empty(n_particles, dtype=np.int64)
+    cell_y = np.empty(n_particles, dtype=np.int64)
+
+    for i in range(n_particles):
+        cx = int(np.floor(coords[i, 0] / cell_size)) % n_cells
+        cy = int(np.floor(coords[i, 1] / cell_size)) % n_cells
+        cell_x[i] = cx
+        cell_y[i] = cy
+        cell_id = cy * n_cells + cx
+        next_index[i] = head[cell_id]
+        head[cell_id] = i
+
+    for i in range(n_particles):
+        base_cx = cell_x[i]
+        base_cy = cell_y[i]
+
+        for offset_y in (-1, 0, 1):
+            neighbor_cy = (base_cy + offset_y) % n_cells
+            for offset_x in (-1, 0, 1):
+                neighbor_cx = (base_cx + offset_x) % n_cells
+                cell_id = neighbor_cy * n_cells + neighbor_cx
+                j = head[cell_id]
+
+                while j != -1:
+                    if i != j:
+                        dx = coords[j, 0] - coords[i, 0]
+                        dy = coords[j, 1] - coords[i, 1]
+
+                        dx = dx - box_length * np.round(dx / box_length)
+                        dy = dy - box_length * np.round(dy / box_length)
+
+                        distance = np.sqrt(dx * dx + dy * dy)
+                        if distance != 0.0 and distance < interaction_radius:
+                            if distance < repulsion_radius:
+                                radial_factor = distance / repulsion_radius - 1.0
+                            else:
+                                radial_factor = 1.0 - (
+                                    (distance - repulsion_radius)
+                                    / (interaction_radius - repulsion_radius)
+                                )
+
+                            strength = interaction_matrix[types[i], types[j]]
+                            scale = force_scale * strength * radial_factor / distance
+                            forces[i, 0] += scale * dx
+                            forces[i, 1] += scale * dy
+
+                    j = next_index[j]
+
+    return forces
 
 
 @dataclass
@@ -169,7 +293,7 @@ class ParticleLifeInteraction:
     def __init__(
         self,
         n_types: int,
-        interaction_radius: float = 16.0,
+        interaction_radius: float = 6.0,
         repulsion_radius: float = 3.0,
         force_scale: float = 1.0,
         seed: int | None = None,
@@ -271,6 +395,42 @@ def copy_particles(particles: list[Particle]) -> list[Particle]:
     ]
 
 
+def particle_arrays(
+    particles: list[Particle],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    pack particle objects into dense arrays for numerical kernels.
+    """
+    coords = np.array([particle.coords for particle in particles], dtype=float)
+    velocities = np.array([particle.vel for particle in particles], dtype=float)
+    masses = np.array([particle.mass for particle in particles], dtype=float)
+    times = np.array([particle.time for particle in particles], dtype=float)
+    types = np.array([particle.type for particle in particles], dtype=np.int64)
+    return coords, velocities, masses, times, types
+
+
+def particles_from_arrays(
+    coords: np.ndarray,
+    velocities: np.ndarray,
+    masses: np.ndarray,
+    times: np.ndarray,
+    types: np.ndarray,
+) -> list[Particle]:
+    """
+    rebuild particle objects from dense arrays after a numerical update.
+    """
+    return [
+        Particle(
+            mass=float(masses[i]),
+            time=float(times[i]),
+            coords=np.array(coords[i], copy=True),
+            vel=np.array(velocities[i], copy=True),
+            type_=int(types[i]),
+        )
+        for i in range(coords.shape[0])
+    ]
+
+
 def make_logger(log_path: Path) -> logging.Logger:
     """
     create the script logger with sysentropy.
@@ -353,26 +513,18 @@ class Euler(Integrator):
         """
         box = kwargs["box"]
         accelerations = rhs(state)
-        next_particles = []
-
-        for particle, acceleration in zip(state, accelerations):
-            if particle.vel is _UNSET:
-                raise ValueError("Euler integration requires velocities on every particle.")
-
-            damped_acceleration = acceleration - self.damping_coefficient * particle.vel
-            next_vel = particle.vel + self.dt * damped_acceleration
-            next_coords = box.wrap(particle.coords + self.dt * particle.vel)
-            next_particles.append(
-                Particle(
-                    mass=particle.mass,
-                    time=particle.time + self.dt,
-                    coords=next_coords,
-                    vel=next_vel,
-                    type_=particle.type,
-                )
-            )
-
-        return next_particles
+        coords, velocities, masses, times, types = particle_arrays(state)
+        damped_accelerations = accelerations - self.damping_coefficient * velocities
+        next_velocities = velocities + self.dt * damped_accelerations
+        next_coords = box.wrap(coords + self.dt * velocities)
+        next_times = times + self.dt
+        return particles_from_arrays(
+            next_coords,
+            next_velocities,
+            masses,
+            next_times,
+            types,
+        )
 
     def integrate(
         self,
@@ -421,27 +573,40 @@ class ParticleLifeSimulation:
         interaction: ParticleLifeInteraction,
         integrator: Integrator,
         logger: logging.Logger,
+        use_cell_list: bool = True,
     ) -> None:
         self.system = system
         self.interaction = interaction
         self.integrator = integrator
         self.logger = logger
+        self._uses_numba = njit is not None
+        self.use_cell_list = use_cell_list
 
     def compute_pairwise_forces(self, particles: list[Particle]) -> list[np.ndarray]:
         """
         compute the net particle-life force on each particle.
         """
-        forces = [np.zeros(2, dtype=float) for _ in particles]
-
-        for i, particle_1 in enumerate(particles):
-            for j, particle_2 in enumerate(particles):
-                if i == j:
-                    continue
-                forces[i] += self.interaction.force(
-                    particle_1, particle_2, self.system.box
-                )
-
-        return forces
+        coords = np.array([particle.coords for particle in particles], dtype=float)
+        types = np.array([particle.type for particle in particles], dtype=np.int64)
+        if self.use_cell_list:
+            return _compute_particle_life_forces_cell_list(
+                coords,
+                types,
+                self.interaction.interaction_matrix,
+                self.system.box.box_length,
+                self.interaction.interaction_radius,
+                self.interaction.repulsion_radius,
+                self.interaction.force_scale,
+            )
+        return _compute_particle_life_forces(
+            coords,
+            types,
+            self.interaction.interaction_matrix,
+            self.system.box.box_length,
+            self.interaction.interaction_radius,
+            self.interaction.repulsion_radius,
+            self.interaction.force_scale,
+        )
 
     def compute_accelerations(self, particles: list[Particle]) -> list[np.ndarray]:
         """
@@ -455,6 +620,8 @@ class ParticleLifeSimulation:
         run the particle-life simulation with the configured integrator.
         """
         self.logger.info("running simulation with %s", type(self.integrator).__name__)
+        self.logger.info("numba acceleration enabled: %s", self._uses_numba)
+        self.logger.info("cell list enabled: %s", self.use_cell_list)
         result = self.integrator.integrate(
             self.compute_accelerations,
             copy_particles(self.system.particles),
@@ -488,26 +655,25 @@ class ParticleLifeSimulation:
         box = self.system.box
         state = copy_particles(self.system.particles)
         current_time = state[0].time
+        point_colors = [particle.color for particle in state]
+        point_sizes = np.full(len(state), 9.0, dtype=float)
 
         figure, ax = fm.layouts.subplots(width="single", aspect=1.0)
-        fm.clean_axes(ax, keep=("left", "bottom"), grid=True, legend=False)
+        fm.clean_axes(ax, keep=("left", "bottom"), grid=False, legend=False)
         ax.set_xlim(0, box.box_length)
         ax.set_ylim(0, box.box_length)
         ax.set_aspect("equal")
         ax.set_xlabel(r"$x$")
         ax.set_ylabel(r"$y$")
-
-        point_artists = []
-        for particle in state:
-            (point_artist,) = ax.plot(
-                [particle.x()],
-                [particle.y()],
-                marker="o",
-                linestyle="none",
-                color=particle.color,
-                markersize=3.0,
-            )
-            point_artists.append(point_artist)
+        initial_offsets = np.array([particle.coords for particle in state], dtype=float)
+        scatter = ax.scatter(
+            initial_offsets[:, 0],
+            initial_offsets[:, 1],
+            s=point_sizes,
+            c=point_colors,
+            edgecolors="none",
+            animated=True,
+        )
 
         def update(_frame_index: int):
             nonlocal state, current_time
@@ -521,19 +687,15 @@ class ParticleLifeSimulation:
                 )
                 current_time = state[0].time
 
-            for particle_index, particle in enumerate(state):
-                point_artists[particle_index].set_data(
-                    [particle.x()],
-                    [particle.y()],
-                )
-
-            return point_artists
+            offsets = np.array([particle.coords for particle in state], dtype=float)
+            scatter.set_offsets(offsets)
+            return (scatter,)
 
         animation = FuncAnimation(
             figure,
             update,
             interval=interval_ms,
-            blit=False,
+            blit=True,
             cache_frame_data=False,
         )
         figure._live_preview_animation = animation
@@ -619,8 +781,8 @@ def main() -> None:
 
     project_dir = Path(__file__).resolve().parent
     logger = make_logger(project_dir / "particle-life.log")
-    number_particles = 50
-    box = PeriodicSquareBox2D(box_length=5)
+    number_particles = 500
+    box = PeriodicSquareBox2D(box_length=50)
     system = ParticlesInaBox.build_initial(number_particles, box, style="random")
     interaction = ParticleLifeInteraction(n_types=len(TYPE_MAP), seed=0)
     integrator = Euler(
@@ -642,7 +804,7 @@ def main() -> None:
                 "axes.grid": True,
             }
         )
-        simulation.live_preview(steps_per_frame=4, interval_ms=16)
+        simulation.live_preview(steps_per_frame=60, interval_ms=16)
     else:
         system.print_particles()
         print(system)
