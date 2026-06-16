@@ -19,10 +19,14 @@ from sysentropy import LoggerConfig, get_logger
 # sentinel object
 _UNSET = object()
 
-type2color = {
-    0: "r",
-    1: "g",
-    2: "b",
+PARTICLE_PALETTE = (
+    *fm.palettes.paper,
+    fm.colors.ina.purple,
+)
+
+TYPE_MAP = {
+    type_index: color
+    for type_index, color in enumerate(PARTICLE_PALETTE)
 }
 
 
@@ -107,7 +111,7 @@ class Particle:
         self.coords = np.asarray(coords, dtype=float)
         self.vel = _UNSET if vel is _UNSET else np.asarray(vel, dtype=float)
         self.type = type_
-        self.color = type2color[type_]
+        self.color = TYPE_MAP[type_]
 
     def x(self) -> float:
         return self.coords[0]
@@ -132,7 +136,7 @@ class Particle:
         the marker area scales like `s \propto \sqrt{m}` so heavier particles
         remain visibly larger without dominating the frame.
         """
-        ax.scatter([self.x()], [self.y()], s=20, color=self.color)
+        ax.scatter([self.x()], [self.y()], s=10, color=self.color)
 
     def distance_to(self, coords2: np.ndarray, box: PeriodicSquareBox2D) -> float:
         """
@@ -148,6 +152,394 @@ class Particle:
         return (
             f"Particle with type={self.type} @ t={self.time}, x={self.coords}, v={vel}"
         )
+
+
+class ParticleLifeInteraction:
+    r"""
+    pairwise particle-life interaction with a fixed type-to-type force matrix.
+
+    for particle types `i` and `j`, the interaction strength is `a_{ij}` from a
+    matrix sampled once at initialization. the pair force is
+    `f_{i \leftarrow j} = s \, a_{ij} \, \phi(r) \, \hat{r}`,
+    where `s` is a global force scale,
+    `r = \|x_j - x_i\|`,
+    and `\hat{r} = (x_j - x_i) / r`.
+    """
+
+    def __init__(
+        self,
+        n_types: int,
+        interaction_radius: float = 16.0,
+        repulsion_radius: float = 3.0,
+        force_scale: float = 1.0,
+        seed: int | None = None,
+        interaction_matrix: np.ndarray | None = None,
+    ) -> None:
+        if n_types <= 0:
+            raise ValueError("n_types must be positive.")
+        if interaction_radius <= 0:
+            raise ValueError("interaction_radius must be positive.")
+        if repulsion_radius <= 0:
+            raise ValueError("repulsion_radius must be positive.")
+        if repulsion_radius >= interaction_radius:
+            raise ValueError("repulsion_radius must be smaller than interaction_radius.")
+
+        self.n_types = n_types
+        self.interaction_radius = interaction_radius
+        self.repulsion_radius = repulsion_radius
+        self.force_scale = force_scale
+
+        if interaction_matrix is None:
+            rng = np.random.default_rng(seed)
+            self.interaction_matrix = rng.uniform(-1.0, 1.0, size=(n_types, n_types))
+        else:
+            matrix = np.asarray(interaction_matrix, dtype=float)
+            if matrix.shape != (n_types, n_types):
+                raise ValueError(
+                    f"interaction_matrix must have shape {(n_types, n_types)}."
+                )
+            self.interaction_matrix = matrix
+
+    def interaction_strength(self, particle_1: Particle, particle_2: Particle) -> float:
+        """
+        return the fixed type-to-type coefficient `a_{ij}`.
+        """
+        return self.interaction_matrix[particle_1.type, particle_2.type]
+
+    def radial_kernel(self, distance: float) -> float:
+        r"""
+        return the scalar radial factor `\phi(r)`.
+
+        for `r < r_{rep}`, the force is repulsive:
+        `\phi(r) = r / r_{rep} - 1`.
+
+        for `r_{rep} \le r < r_{int}`, the force magnitude decays linearly:
+        `\phi(r) = 1 - (r - r_{rep}) / (r_{int} - r_{rep})`.
+
+        for `r \ge r_{int}`, the interaction vanishes:
+        `\phi(r) = 0`.
+        """
+        if distance >= self.interaction_radius:
+            return 0.0
+        if distance < self.repulsion_radius:
+            return distance / self.repulsion_radius - 1.0
+        return 1.0 - (
+            (distance - self.repulsion_radius)
+            / (self.interaction_radius - self.repulsion_radius)
+        )
+
+    def force(
+        self,
+        particle_1: Particle,
+        particle_2: Particle,
+        box: PeriodicSquareBox2D,
+    ) -> np.ndarray:
+        r"""
+        force acting on particle 1 due to particle 2.
+
+        the implemented law is
+        `f_{1 \leftarrow 2} = s \, a_{12} \, \phi(r) \, \hat{r}`,
+        with `\hat{r} = (x_2 - x_1) / \|x_2 - x_1\|`.
+        """
+        distance, displacement = box.distance(
+            particle_1.coords, particle_2.coords, with_disp=True
+        )
+        if distance == 0:
+            return np.zeros(2, dtype=float)
+
+        direction = displacement / distance
+        strength = self.interaction_strength(particle_1, particle_2)
+        radial_factor = self.radial_kernel(distance)
+        return self.force_scale * strength * radial_factor * direction
+
+
+def copy_particles(particles: list[Particle]) -> list[Particle]:
+    """
+    make detached particle copies so trajectories and previews do not alias.
+    """
+    return [
+        Particle(
+            mass=particle.mass,
+            time=particle.time,
+            coords=np.array(particle.coords, copy=True),
+            vel=_UNSET
+            if particle.vel is _UNSET
+            else np.array(particle.vel, copy=True),
+            type_=particle.type,
+        )
+        for particle in particles
+    ]
+
+
+def make_logger(log_path: Path) -> logging.Logger:
+    """
+    create the script logger with sysentropy.
+    """
+    logger_config = LoggerConfig(
+        level=logging.INFO,
+        log_file=log_path,
+        console_format="%(asctime)s %(levelname_fixed)s %(message)s",
+        file_format="%(asctime)s %(levelname_fixed)s %(message)s",
+        use_colors=True,
+    )
+    return get_logger("particle-life", config=logger_config)
+
+
+class Integrator(ABC):
+    """
+    generic integrator interface in the same spirit as pfnumerics.
+    """
+
+    @abstractmethod
+    def forward(
+        self,
+        rhs: Callable[[list[Particle]], list[np.ndarray]],
+        t: float,
+        state: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """
+        advance the state by one integration step.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def integrate(
+        self,
+        rhs: Callable[[list[Particle]], list[np.ndarray]],
+        x: Any,
+        *,
+        all_trj: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        """
+        integrate a state or trajectory using a consistent high-level api.
+        """
+        raise NotImplementedError
+
+
+class Euler(Integrator):
+    r"""
+    fixed-step Euler integrator for particle-life dynamics.
+
+    the state update is
+    `v_{n+1} = v_n + \Delta t \, (a_n - \gamma v_n)`,
+    `x_{n+1} = x_n + \Delta t \, v_n`,
+    where `\gamma` is the damping coefficient.
+    """
+
+    def __init__(
+        self,
+        t_bounds: Sequence[float],
+        n_steps: int,
+        damping_coefficient: float,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self.t_bounds = t_bounds
+        self.n_steps = n_steps
+        self.dt = (float(t_bounds[1]) - float(t_bounds[0])) / n_steps
+        self.damping_coefficient = damping_coefficient
+        self.logger = logger
+
+    def forward(
+        self,
+        rhs: Callable[[list[Particle]], list[np.ndarray]],
+        t: float,
+        state: list[Particle],
+        **kwargs: Any,
+    ) -> list[Particle]:
+        """
+        advance the particle system by one Euler step.
+        """
+        box = kwargs["box"]
+        accelerations = rhs(state)
+        next_particles = []
+
+        for particle, acceleration in zip(state, accelerations):
+            if particle.vel is _UNSET:
+                raise ValueError("Euler integration requires velocities on every particle.")
+
+            damped_acceleration = acceleration - self.damping_coefficient * particle.vel
+            next_vel = particle.vel + self.dt * damped_acceleration
+            next_coords = box.wrap(particle.coords + self.dt * particle.vel)
+            next_particles.append(
+                Particle(
+                    mass=particle.mass,
+                    time=particle.time + self.dt,
+                    coords=next_coords,
+                    vel=next_vel,
+                    type_=particle.type,
+                )
+            )
+
+        return next_particles
+
+    def integrate(
+        self,
+        rhs: Callable[[list[Particle]], list[np.ndarray]],
+        x: list[Particle],
+        *,
+        all_trj: bool = False,
+        **kwargs: Any,
+    ) -> list[list[Particle]] | list[Particle]:
+        """
+        integrate the particle system across the configured time interval.
+        """
+        state = copy_particles(x)
+        history = [copy_particles(state)] if all_trj else None
+        progress_stride = max(1, self.n_steps // 20)
+
+        for step_index in range(self.n_steps):
+            t = self.t_bounds[0] + step_index * self.dt
+            state = self.forward(rhs, t, state, **kwargs)
+            if all_trj:
+                history.append(copy_particles(state))
+            if self.logger is not None and (
+                step_index == 0
+                or (step_index + 1) % progress_stride == 0
+                or step_index + 1 == self.n_steps
+            ):
+                self.logger.info(
+                    "simulation step %d / %d",
+                    step_index + 1,
+                    self.n_steps,
+                )
+
+        if all_trj:
+            return history
+        return state
+
+
+class ParticleLifeSimulation:
+    """
+    particle-life evolution under pairwise type-dependent interactions.
+    """
+
+    def __init__(
+        self,
+        system: "ParticlesInaBox",
+        interaction: ParticleLifeInteraction,
+        integrator: Integrator,
+        logger: logging.Logger,
+    ) -> None:
+        self.system = system
+        self.interaction = interaction
+        self.integrator = integrator
+        self.logger = logger
+
+    def compute_pairwise_forces(self, particles: list[Particle]) -> list[np.ndarray]:
+        """
+        compute the net particle-life force on each particle.
+        """
+        forces = [np.zeros(2, dtype=float) for _ in particles]
+
+        for i, particle_1 in enumerate(particles):
+            for j, particle_2 in enumerate(particles):
+                if i == j:
+                    continue
+                forces[i] += self.interaction.force(
+                    particle_1, particle_2, self.system.box
+                )
+
+        return forces
+
+    def compute_accelerations(self, particles: list[Particle]) -> list[np.ndarray]:
+        """
+        compute accelerations from the net type-dependent forces.
+        """
+        forces = self.compute_pairwise_forces(particles)
+        return [force / particle.mass for force, particle in zip(forces, particles)]
+
+    def run(self, all_trj: bool = True) -> list[list[Particle]] | list[Particle]:
+        """
+        run the particle-life simulation with the configured integrator.
+        """
+        self.logger.info("running simulation with %s", type(self.integrator).__name__)
+        result = self.integrator.integrate(
+            self.compute_accelerations,
+            copy_particles(self.system.particles),
+            box=self.system.box,
+            all_trj=all_trj,
+        )
+        final_particles = result[-1] if all_trj else result
+        self.system.particles = copy_particles(final_particles)
+        self.logger.info("finished simulation")
+        return result
+
+    def live_preview(
+        self,
+        *,
+        steps_per_frame: int = 4,
+        interval_ms: int = 16,
+    ) -> None:
+        """
+        render the evolving particle-life system in a live matplotlib window.
+        """
+        if steps_per_frame <= 0:
+            raise ValueError("steps_per_frame must be positive.")
+        if interval_ms <= 0:
+            raise ValueError("interval_ms must be positive.")
+
+        self.logger.info(
+            "starting live preview with steps_per_frame=%d",
+            steps_per_frame,
+        )
+
+        box = self.system.box
+        state = copy_particles(self.system.particles)
+        current_time = state[0].time
+
+        figure, ax = fm.layouts.subplots(width="single", aspect=1.0)
+        fm.clean_axes(ax, keep=("left", "bottom"), grid=True, legend=False)
+        ax.set_xlim(0, box.box_length)
+        ax.set_ylim(0, box.box_length)
+        ax.set_aspect("equal")
+        ax.set_xlabel(r"$x$")
+        ax.set_ylabel(r"$y$")
+
+        point_artists = []
+        for particle in state:
+            (point_artist,) = ax.plot(
+                [particle.x()],
+                [particle.y()],
+                marker="o",
+                linestyle="none",
+                color=particle.color,
+                markersize=3.0,
+            )
+            point_artists.append(point_artist)
+
+        def update(_frame_index: int):
+            nonlocal state, current_time
+
+            for _ in range(steps_per_frame):
+                state = self.integrator.forward(
+                    self.compute_accelerations,
+                    current_time,
+                    state,
+                    box=box,
+                )
+                current_time = state[0].time
+
+            for particle_index, particle in enumerate(state):
+                point_artists[particle_index].set_data(
+                    [particle.x()],
+                    [particle.y()],
+                )
+
+            return point_artists
+
+        animation = FuncAnimation(
+            figure,
+            update,
+            interval=interval_ms,
+            blit=False,
+            cache_frame_data=False,
+        )
+        figure._live_preview_animation = animation
+        plt.show()
+        self.system.particles = copy_particles(state)
+        self.logger.info("live preview closed")
 
 
 class ParticlesInaBox:
@@ -177,30 +569,84 @@ class ParticlesInaBox:
         for particle in self.particles:
             particle.plot(ax)
 
+    def live_preview(self) -> None:
+        """
+        show the current particle configuration in an interactive matplotlib window.
+        """
+        figure, ax = fm.layouts.subplots(width="single", aspect=1.0)
+        self.plot(ax)
+        ax.set_xlim(0, self.box.box_length)
+        ax.set_ylim(0, self.box.box_length)
+        ax.set_aspect("equal")
+        ax.set_xlabel(r"$x$")
+        ax.set_ylabel(r"$y$")
+        fm.clean_axes(ax, keep=("left", "bottom"), grid=True, legend=False)
+        figure.tight_layout()
+        plt.show()
+
+    @classmethod
+    def build_initial(cls, number_particles, box, style="random"):
+        types = TYPE_MAP.keys()
+        rng = np.random.default_rng()
+        if style == "random":
+            particles = [
+                Particle(
+                    mass=1.0,
+                    time=0,
+                    coords=box.random_coordinate(),
+                    vel=np.random.rand(2),
+                    type_=rng.integers(0, high=len(types)),
+                )
+                for _ in range(number_particles)
+            ]
+        else:
+            raise ValueError(f"Unrecognized style {style}. Supported 'random'")
+
+        return ParticlesInaBox(particles, box)
+
     def __repr__(self) -> str:
         return f"System with {len(self.particles)} particles in box of size {self.box.box_length}"
 
 
-def main():
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="show the current particle configuration in an interactive window",
+    )
+    args = parser.parse_args()
 
-    number_particles = 100
-    box = PeriodicSquareBox2D(box_length=100)
-    box_center = np.array([box.half_box_length, box.half_box_length])
-
-    rng = np.random.default_rng()
-    random_particles = [
-        Particle(
-            mass=1.0,
-            time=0,
-            coords=box.random_coordinate(),
-            vel=np.random.rand(2),
-            type_=rng.integers(0, high=3),
+    project_dir = Path(__file__).resolve().parent
+    logger = make_logger(project_dir / "particle-life.log")
+    number_particles = 50
+    box = PeriodicSquareBox2D(box_length=5)
+    system = ParticlesInaBox.build_initial(number_particles, box, style="random")
+    interaction = ParticleLifeInteraction(n_types=len(TYPE_MAP), seed=0)
+    integrator = Euler(
+        t_bounds=(0.0, 400.0),
+        n_steps=40_000,
+        damping_coefficient=0.8,
+        logger=logger,
+    )
+    simulation = ParticleLifeSimulation(
+        system=system,
+        interaction=interaction,
+        integrator=integrator,
+        logger=logger,
+    )
+    if args.preview:
+        fm.apply_style(
+            {
+                "figure.figsize": fm.layouts.size(width="single", aspect=1.0),
+                "axes.grid": True,
+            }
         )
-        for _ in range(number_particles)
-    ]
-    system = ParticlesInaBox(random_particles, box)
-    system.print_particles()
-    print(system)
+        simulation.live_preview(steps_per_frame=4, interval_ms=16)
+    else:
+        system.print_particles()
+        print(system)
+        print(interaction.interaction_matrix)
 
 
 if __name__ == "__main__":
