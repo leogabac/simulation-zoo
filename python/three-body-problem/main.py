@@ -1,4 +1,6 @@
+import argparse
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass
 import logging
 import os
@@ -9,6 +11,7 @@ from typing import Any, Callable, Sequence
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import numpy as np
+from matplotlib.animation import FuncAnimation
 import matplotlib.pyplot as plt
 import fubumio as fm
 from sysentropy import LoggerConfig, get_logger
@@ -111,7 +114,7 @@ class Particle:
         return self.vel[1]
 
     def plot(self, ax: plt.Axes) -> None:
-        """
+        r"""
         draw the particle position on a matplotlib axes.
 
         the marker area scales like `s \propto \sqrt{m}` so heavier particles
@@ -619,6 +622,129 @@ class ThreeBodySimulation:
 
         self.logger.info("finished writing frame images")
 
+    def live_preview(
+        self,
+        *,
+        steps_per_frame: int = 8,
+        trail_length: int = 250,
+        interval_ms: int = 16,
+    ) -> None:
+        r"""
+        render the simulation in a live matplotlib window without saving frames.
+
+        the displayed state advances by repeatedly applying the integrator
+        update, while each particle keeps a recent trail
+        `(x_{k-\ell+1}, \ldots, x_k)`
+        with `\ell = \mathrm{trail\_length}`.
+        """
+        if steps_per_frame <= 0:
+            raise ValueError("steps_per_frame must be positive.")
+        if trail_length <= 0:
+            raise ValueError("trail_length must be positive.")
+        if interval_ms <= 0:
+            raise ValueError("interval_ms must be positive.")
+        if not isinstance(self.integrator, PositionVerlet):
+            raise TypeError("live_preview currently expects a PositionVerlet integrator.")
+
+        self.logger.info(
+            "starting live preview with steps_per_frame=%d, trail_length=%d",
+            steps_per_frame,
+            trail_length,
+        )
+
+        box = self.system.box
+        state = self.integrator.initialize(
+            self.compute_accelerations,
+            copy_particles(self.system.particles),
+            box=box,
+        )
+        current_time = state.current_particles[0].time
+
+        figure, ax = fm.layouts.subplots(width="single", aspect=1.0)
+        fm.clean_axes(ax, keep=("left", "bottom"), grid=True, legend=False)
+        ax.set_xlim(0, box.box_length)
+        ax.set_ylim(0, box.box_length)
+        ax.set_aspect("equal")
+        ax.set_xlabel(r"$x$")
+        ax.set_ylabel(r"$y$")
+
+        colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+        trail_buffers = [
+            deque([np.array(particle.coords, copy=True)], maxlen=trail_length)
+            for particle in state.current_particles
+        ]
+        trail_lines = []
+        point_artists = []
+
+        for particle_index, particle in enumerate(state.current_particles):
+            color = colors[particle_index % len(colors)]
+            (trail_line,) = ax.plot(
+                [],
+                [],
+                color=color,
+                alpha=0.4,
+                linewidth=1.5,
+            )
+            (point_artist,) = ax.plot(
+                [particle.x()],
+                [particle.y()],
+                marker="o",
+                linestyle="none",
+                color=color,
+                # markersize=4.0 * np.sqrt(particle.mass),
+                markersize=4.0,
+            )
+            trail_lines.append(trail_line)
+            point_artists.append(point_artist)
+
+        def append_trail(buffer: deque[np.ndarray], coords: np.ndarray) -> None:
+            # if the particle crosses the periodic seam, insert a nan marker so
+            # matplotlib breaks the rendered line instead of drawing across the box
+            if buffer:
+                previous_coords = buffer[-1]
+                if np.any(np.abs(coords - previous_coords) > 0.5 * box.box_length):
+                    buffer.append(np.array([np.nan, np.nan]))
+            buffer.append(np.array(coords, copy=True))
+
+        def update(_frame_index: int):
+            nonlocal state, current_time
+
+            for _ in range(steps_per_frame):
+                state = self.integrator.forward(
+                    self.compute_accelerations,
+                    current_time,
+                    state,
+                    box=box,
+                )
+                current_time = state.current_particles[0].time
+                for particle_index, particle in enumerate(state.current_particles):
+                    append_trail(trail_buffers[particle_index], particle.coords)
+
+            for particle_index, particle in enumerate(state.current_particles):
+                trail_coords = np.asarray(trail_buffers[particle_index], dtype=float)
+                trail_lines[particle_index].set_data(
+                    trail_coords[:, 0],
+                    trail_coords[:, 1],
+                )
+                point_artists[particle_index].set_data(
+                    [particle.x()],
+                    [particle.y()],
+                )
+
+            return trail_lines + point_artists
+
+        animation = FuncAnimation(
+            figure,
+            update,
+            interval=interval_ms,
+            blit=False,
+            cache_frame_data=False,
+        )
+        figure._live_preview_animation = animation
+        plt.show()
+        self.system.particles = copy_particles(state.current_particles)
+        self.logger.info("live preview closed")
+
     def make_video(
         self,
         frames_dir: str | Path,
@@ -668,6 +794,14 @@ class ThreeBodySimulation:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--live-preview",
+        action="store_true",
+        help="render the simulation in a live window instead of saving frames",
+    )
+    args = parser.parse_args()
+
     project_dir = Path(__file__).resolve().parent
     logger = make_logger(project_dir / "three-body-problem.log")
     fm.apply_style(
@@ -676,26 +810,26 @@ def main() -> None:
             "axes.grid": True,
         }
     )
-    box = PeriodicSquareBox2D(box_length=20)
+    box = PeriodicSquareBox2D(box_length=35)
     box_center = np.array([box.half_box_length, box.half_box_length])
 
     # this is a deliberately asymmetric binary-plus-intruder setup.
     # it is less orderly than the figure-eight orbit, which tends to make the
     # trails and the final video more visually interesting.
-    r1 = box_center + np.array([0.0, 4.0])
-    r2 = box_center + np.array([4.0, 0.0])
-    r3 = box_center + np.array([0.0, -4.0])
+    r1 = box_center + np.array([0.0, 10.0])
+    r2 = box_center
+    r3 = box_center + np.array([0.0, -10.0])
 
-    v1 = np.array([-0.6, -1.4])
-    v2 = np.array([-1.0, 0.5])
-    v3 = np.array([0.5, 0.5])
+    v1 = np.array([-1.5, -0.2])
+    v2 = np.array([0.0, 0.0])
+    v3 = np.array([1.5, 0.2])
 
     p1 = Particle(mass=3.0, time=0, coords=r1, vel=v1)
-    p2 = Particle(mass=1.4, time=0, coords=r2, vel=v2)
+    p2 = Particle(mass=50, time=0, coords=r2, vel=v2)
     p3 = Particle(mass=0.9, time=0, coords=r3, vel=v3)
     system = ParticlesInaBox([p1, p2, p3], box=box)
 
-    interaction = GravitationalInteraction(gravitational_constant=1.8)
+    interaction = GravitationalInteraction(gravitational_constant=1.0)
     integrator = PositionVerlet(
         t_bounds=(0.0, 144.0),
         n_steps=24_000,
@@ -704,16 +838,23 @@ def main() -> None:
     simulation = ThreeBodySimulation(
         system, interaction, integrator=integrator, logger=logger
     )
-    history = simulation.run(all_trj=True)
-    output_dir = project_dir / "frames"
-    video_path = project_dir / "three-body-problem.mp4"
-    simulation.save_frames(
-        history,
-        output_dir=output_dir,
-        trail_length=160,
-        frame_stride=14,
-    )
-    simulation.make_video(output_dir, video_path)
+    if args.live_preview:
+        simulation.live_preview(
+            steps_per_frame=15,
+            trail_length=150,
+            interval_ms=16,
+        )
+    else:
+        history = simulation.run(all_trj=True)
+        output_dir = project_dir / "frames"
+        video_path = project_dir / "three-body-problem.mp4"
+        simulation.save_frames(
+            history,
+            output_dir=output_dir,
+            trail_length=160,
+            frame_stride=14,
+        )
+        simulation.make_video(output_dir, video_path)
 
 
 if __name__ == "__main__":
