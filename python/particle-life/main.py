@@ -25,8 +25,11 @@ except ImportError:  # pragma: no cover
 _UNSET = object()
 
 PARTICLE_PALETTE = (
-    *fm.palettes.paper,
-    fm.colors.ina.purple,
+    fm.palettes.paper[0],
+    fm.palettes.paper[1],
+    fm.palettes.paper[2],
+    fm.palettes.paper[3],
+    fm.palettes.paper[4],
 )
 
 TYPE_MAP = {
@@ -71,15 +74,14 @@ def _compute_particle_life_forces(
                 continue
 
             if distance < repulsion_radius:
-                radial_factor = distance / repulsion_radius - 1.0
+                scale = force_scale * (distance / repulsion_radius - 1.0) / distance
             else:
                 radial_factor = 1.0 - (
                     (distance - repulsion_radius)
                     / (interaction_radius - repulsion_radius)
                 )
-
-            strength = interaction_matrix[types[i], types[j]]
-            scale = force_scale * strength * radial_factor / distance
+                strength = interaction_matrix[types[i], types[j]]
+                scale = force_scale * strength * radial_factor / distance
             forces[i, 0] += scale * dx
             forces[i, 1] += scale * dy
 
@@ -137,21 +139,57 @@ def _compute_particle_life_forces_cell_list(
                         distance = np.sqrt(dx * dx + dy * dy)
                         if distance != 0.0 and distance < interaction_radius:
                             if distance < repulsion_radius:
-                                radial_factor = distance / repulsion_radius - 1.0
+                                scale = (
+                                    force_scale
+                                    * (distance / repulsion_radius - 1.0)
+                                    / distance
+                                )
                             else:
                                 radial_factor = 1.0 - (
                                     (distance - repulsion_radius)
                                     / (interaction_radius - repulsion_radius)
                                 )
-
-                            strength = interaction_matrix[types[i], types[j]]
-                            scale = force_scale * strength * radial_factor / distance
+                                strength = interaction_matrix[types[i], types[j]]
+                                scale = (
+                                    force_scale * strength * radial_factor / distance
+                                )
                             forces[i, 0] += scale * dx
                             forces[i, 1] += scale * dy
 
                     j = next_index[j]
 
     return forces
+
+
+@_njit
+def _advance_particle_life_euler_inplace(
+    coords: np.ndarray,
+    velocities: np.ndarray,
+    masses: np.ndarray,
+    types: np.ndarray,
+    interaction_matrix: np.ndarray,
+    box_length: float,
+    interaction_radius: float,
+    repulsion_radius: float,
+    force_scale: float,
+    damping_coefficient: float,
+    dt: float,
+    n_substeps: int,
+) -> None:
+    for _ in range(n_substeps):
+        forces = _compute_particle_life_forces_cell_list(
+            coords,
+            types,
+            interaction_matrix,
+            box_length,
+            interaction_radius,
+            repulsion_radius,
+            force_scale,
+        )
+        accelerations = forces / masses[:, None]
+        velocities += dt * (accelerations - damping_coefficient * velocities)
+        coords += dt * velocities
+        coords %= box_length
 
 
 @dataclass
@@ -284,10 +322,20 @@ class ParticleLifeInteraction:
 
     for particle types `i` and `j`, the interaction strength is `a_{ij}` from a
     matrix sampled once at initialization. the pair force is
-    `f_{i \leftarrow j} = s \, a_{ij} \, \phi(r) \, \hat{r}`,
+    `f_{i \leftarrow j} = s \, \psi_{ij}(r) \, \hat{r}`,
     where `s` is a global force scale,
     `r = \|x_j - x_i\|`,
     and `\hat{r} = (x_j - x_i) / r`.
+
+    the radial law is split into an unconditional repulsive core and a
+    type-dependent interaction shell:
+
+    `\psi_{ij}(r) = r / r_{rep} - 1` for `r < r_{rep}`,
+
+    `\psi_{ij}(r) = a_{ij} \left[1 - (r - r_{rep}) / (r_{int} - r_{rep})\right]`
+    for `r_{rep} \le r < r_{int}`,
+
+    and `\psi_{ij}(r) = 0` for `r \ge r_{int}`.
     """
 
     def __init__(
@@ -332,21 +380,18 @@ class ParticleLifeInteraction:
 
     def radial_kernel(self, distance: float) -> float:
         r"""
-        return the scalar radial factor `\phi(r)`.
+        return the scalar type-dependent shell factor `\phi(r)`.
 
-        for `r < r_{rep}`, the force is repulsive:
-        `\phi(r) = r / r_{rep} - 1`.
-
-        for `r_{rep} \le r < r_{int}`, the force magnitude decays linearly:
+        for `r_{rep} \le r < r_{int}`, the interaction magnitude decays linearly:
         `\phi(r) = 1 - (r - r_{rep}) / (r_{int} - r_{rep})`.
+
+        for `r < r_{rep}` and for `r \ge r_{int}`, this shell factor is not used.
 
         for `r \ge r_{int}`, the interaction vanishes:
         `\phi(r) = 0`.
         """
         if distance >= self.interaction_radius:
             return 0.0
-        if distance < self.repulsion_radius:
-            return distance / self.repulsion_radius - 1.0
         return 1.0 - (
             (distance - self.repulsion_radius)
             / (self.interaction_radius - self.repulsion_radius)
@@ -362,7 +407,13 @@ class ParticleLifeInteraction:
         force acting on particle 1 due to particle 2.
 
         the implemented law is
-        `f_{1 \leftarrow 2} = s \, a_{12} \, \phi(r) \, \hat{r}`,
+        `f_{1 \leftarrow 2} = s \, (r / r_{rep} - 1) \, \hat{r}` for
+        `r < r_{rep}`,
+
+        and
+        `f_{1 \leftarrow 2} = s \, a_{12} \, \phi(r) \, \hat{r}` for
+        `r_{rep} \le r < r_{int}`,
+
         with `\hat{r} = (x_2 - x_1) / \|x_2 - x_1\|`.
         """
         distance, displacement = box.distance(
@@ -372,6 +423,10 @@ class ParticleLifeInteraction:
             return np.zeros(2, dtype=float)
 
         direction = displacement / distance
+        if distance < self.repulsion_radius:
+            radial_factor = distance / self.repulsion_radius - 1.0
+            return self.force_scale * radial_factor * direction
+
         strength = self.interaction_strength(particle_1, particle_2)
         radial_factor = self.radial_kernel(distance)
         return self.force_scale * strength * radial_factor * direction
@@ -646,6 +701,8 @@ class ParticleLifeSimulation:
             raise ValueError("steps_per_frame must be positive.")
         if interval_ms <= 0:
             raise ValueError("interval_ms must be positive.")
+        if not isinstance(self.integrator, Euler):
+            raise TypeError("live_preview currently expects an Euler integrator.")
 
         self.logger.info(
             "starting live preview with steps_per_frame=%d",
@@ -653,10 +710,10 @@ class ParticleLifeSimulation:
         )
 
         box = self.system.box
-        state = copy_particles(self.system.particles)
-        current_time = state[0].time
-        point_colors = [particle.color for particle in state]
-        point_sizes = np.full(len(state), 9.0, dtype=float)
+        coords, velocities, masses, times, types = particle_arrays(self.system.particles)
+        current_time = float(times[0])
+        point_colors = [TYPE_MAP[int(type_index)] for type_index in types]
+        point_sizes = np.full(coords.shape[0], 9.0, dtype=float)
 
         figure, ax = fm.layouts.subplots(width="single", aspect=1.0)
         fm.clean_axes(ax, keep=("left", "bottom"), grid=False, legend=False)
@@ -665,10 +722,9 @@ class ParticleLifeSimulation:
         ax.set_aspect("equal")
         ax.set_xlabel(r"$x$")
         ax.set_ylabel(r"$y$")
-        initial_offsets = np.array([particle.coords for particle in state], dtype=float)
         scatter = ax.scatter(
-            initial_offsets[:, 0],
-            initial_offsets[:, 1],
+            coords[:, 0],
+            coords[:, 1],
             s=point_sizes,
             c=point_colors,
             edgecolors="none",
@@ -676,19 +732,24 @@ class ParticleLifeSimulation:
         )
 
         def update(_frame_index: int):
-            nonlocal state, current_time
+            nonlocal current_time
 
-            for _ in range(steps_per_frame):
-                state = self.integrator.forward(
-                    self.compute_accelerations,
-                    current_time,
-                    state,
-                    box=box,
-                )
-                current_time = state[0].time
-
-            offsets = np.array([particle.coords for particle in state], dtype=float)
-            scatter.set_offsets(offsets)
+            _advance_particle_life_euler_inplace(
+                coords,
+                velocities,
+                masses,
+                types,
+                self.interaction.interaction_matrix,
+                box.box_length,
+                self.interaction.interaction_radius,
+                self.interaction.repulsion_radius,
+                self.interaction.force_scale,
+                self.integrator.damping_coefficient,
+                self.integrator.dt,
+                steps_per_frame,
+            )
+            current_time += steps_per_frame * self.integrator.dt
+            scatter.set_offsets(coords)
             return (scatter,)
 
         animation = FuncAnimation(
@@ -700,7 +761,14 @@ class ParticleLifeSimulation:
         )
         figure._live_preview_animation = animation
         plt.show()
-        self.system.particles = copy_particles(state)
+        final_times = np.full(coords.shape[0], current_time, dtype=float)
+        self.system.particles = particles_from_arrays(
+            coords,
+            velocities,
+            masses,
+            final_times,
+            types,
+        )
         self.logger.info("live preview closed")
 
 
@@ -747,22 +815,122 @@ class ParticlesInaBox:
         plt.show()
 
     @classmethod
-    def build_initial(cls, number_particles, box, style="random"):
+    def build_initial(
+        cls,
+        number_particles: int,
+        box: PeriodicSquareBox2D,
+        style: str = "random",
+        seed: int | None = None,
+        type_probabilities: np.ndarray | None = None,
+        velocity_scale: float = 0.0,
+        extra_random_particles: int = 0,
+        extra_type_probabilities: np.ndarray | None = None,
+    ) -> "ParticlesInaBox":
+        """
+        build an initial condition inside the periodic box.
+
+        for `style = "random"`, positions are sampled uniformly in the box.
+
+        for `style = "core_shell"`, type `1` is seeded in a central disk, type
+        `0` is seeded in an annulus around it, and higher types are seeded in
+        progressively broader outer bands. this gives each species a distinct
+        initial radial role instead of asking the morphology to emerge from a
+        fully homogeneous cloud.
+
+        if `extra_random_particles > 0`, additional particles are then sampled
+        uniformly in the box. this lets the simulation keep a seeded core/shell
+        droplet while also adding a dilute background population.
+        """
+        if extra_random_particles < 0:
+            raise ValueError("extra_random_particles must be non-negative.")
+
         types = TYPE_MAP.keys()
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(seed)
+        if type_probabilities is None:
+            type_probabilities = np.full(len(types), 1.0 / len(types), dtype=float)
+        else:
+            type_probabilities = np.asarray(type_probabilities, dtype=float)
+            if type_probabilities.shape != (len(types),):
+                raise ValueError(
+                    f"type_probabilities must have shape {(len(types),)}."
+                )
+            total = np.sum(type_probabilities)
+            if total <= 0:
+                raise ValueError("type_probabilities must have positive sum.")
+            type_probabilities = type_probabilities / total
+
+        if extra_type_probabilities is None:
+            extra_type_probabilities = type_probabilities
+        else:
+            extra_type_probabilities = np.asarray(extra_type_probabilities, dtype=float)
+            if extra_type_probabilities.shape != (len(types),):
+                raise ValueError(
+                    f"extra_type_probabilities must have shape {(len(types),)}."
+                )
+            total = np.sum(extra_type_probabilities)
+            if total <= 0:
+                raise ValueError("extra_type_probabilities must have positive sum.")
+            extra_type_probabilities = extra_type_probabilities / total
+
         if style == "random":
             particles = [
                 Particle(
                     mass=1.0,
                     time=0,
                     coords=box.random_coordinate(),
-                    vel=np.random.rand(2),
-                    type_=rng.integers(0, high=len(types)),
+                    vel=rng.normal(loc=0.0, scale=velocity_scale, size=2),
+                    type_=rng.choice(len(types), p=type_probabilities),
                 )
                 for _ in range(number_particles)
             ]
+        elif style == "core_shell":
+            center = np.full(2, box.box_length / 2.0, dtype=float)
+            radial_means = np.array([0.22, 0.08, 0.34, 0.43, 0.50], dtype=float)
+            radial_widths = np.array([0.035, 0.035, 0.050, 0.045, 0.035], dtype=float)
+            particles = []
+
+            for _ in range(number_particles):
+                type_index = int(rng.choice(len(types), p=type_probabilities))
+                angle = rng.uniform(0.0, 2.0 * np.pi)
+
+                if type_index == 1:
+                    radius = abs(rng.normal(scale=0.035 * box.box_length))
+                else:
+                    mean_index = min(type_index, len(radial_means) - 1)
+                    radius = box.box_length * radial_means[mean_index]
+                    radius += rng.normal(
+                        scale=box.box_length * radial_widths[mean_index]
+                    )
+                    radius = max(0.0, radius)
+
+                coords = center + radius * np.array(
+                    [np.cos(angle), np.sin(angle)],
+                    dtype=float,
+                )
+                particles.append(
+                    Particle(
+                        mass=1.0,
+                        time=0,
+                        coords=box.wrap(coords),
+                        vel=rng.normal(loc=0.0, scale=velocity_scale, size=2),
+                        type_=type_index,
+                    )
+                )
         else:
-            raise ValueError(f"Unrecognized style {style}. Supported 'random'")
+            raise ValueError(
+                f"Unrecognized style {style}. Supported 'random', 'core_shell'"
+            )
+
+        for _ in range(extra_random_particles):
+            particles.append(
+                Particle(
+                    mass=1.0,
+                    time=0,
+                    coords=box.random_coordinate(),
+                    vel=rng.normal(loc=0.0, scale=velocity_scale, size=2),
+                    type_=int(rng.choice(len(types), p=extra_type_probabilities)),
+                )
+            )
 
         return ParticlesInaBox(particles, box)
 
@@ -777,18 +945,48 @@ def main() -> None:
         action="store_true",
         help="show the current particle configuration in an interactive window",
     )
+    parser.add_argument(
+        "--state-seed",
+        type=int,
+        default=5,
+        help="seed for the initial particle positions and velocities",
+    )
     args = parser.parse_args()
 
     project_dir = Path(__file__).resolve().parent
     logger = make_logger(project_dir / "particle-life.log")
-    number_particles = 500
-    box = PeriodicSquareBox2D(box_length=50)
-    system = ParticlesInaBox.build_initial(number_particles, box, style="random")
-    interaction = ParticleLifeInteraction(n_types=len(TYPE_MAP), seed=0)
+    number_particles = 700
+    box = PeriodicSquareBox2D(box_length=20)
+    type_probabilities = np.array([0.30, 0.24, 0.18, 0.16, 0.12], dtype=float)
+    system = ParticlesInaBox.build_initial(
+        number_particles,
+        box,
+        style="core_shell",
+        seed=args.state_seed,
+        type_probabilities=type_probabilities,
+        velocity_scale=0.0,
+    )
+    interaction_matrix = np.array(
+        [
+            [0.18, 0.36, 0.14, 0.08, -0.10],
+            [-0.28, 0.56, -0.10, -0.18, -0.26],
+            [0.28, -0.16, 0.16, 0.24, 0.06],
+            [0.14, -0.24, 0.18, 0.20, 0.28],
+            [-0.04, -0.30, 0.10, 0.24, 0.12],
+        ],
+        dtype=float,
+    )
+    interaction = ParticleLifeInteraction(
+        n_types=len(TYPE_MAP),
+        interaction_radius=5.6,
+        repulsion_radius=1.2,
+        force_scale=0.95,
+        interaction_matrix=interaction_matrix,
+    )
     integrator = Euler(
-        t_bounds=(0.0, 400.0),
-        n_steps=40_000,
-        damping_coefficient=0.8,
+        t_bounds=(0.0, 500.0),
+        n_steps=200_000,
+        damping_coefficient=0.85,
         logger=logger,
     )
     simulation = ParticleLifeSimulation(
@@ -801,13 +999,18 @@ def main() -> None:
         fm.apply_style(
             {
                 "figure.figsize": fm.layouts.size(width="single", aspect=1.0),
-                "axes.grid": True,
+                "axes.grid": False,
             }
         )
-        simulation.live_preview(steps_per_frame=60, interval_ms=16)
+        logger.info(
+            "preview with state_seed=%d",
+            args.state_seed,
+        )
+        simulation.live_preview(steps_per_frame=16, interval_ms=16)
     else:
         system.print_particles()
         print(system)
+        print(f"state_seed={args.state_seed}")
         print(interaction.interaction_matrix)
 
 
